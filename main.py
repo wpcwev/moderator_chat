@@ -12,14 +12,16 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ChatPermissions
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from zoneinfo import ZoneInfo
+
 # ==================== НАСТРОЙКИ ====================
-# Токен из переменной окружения TGTOKEN или впиши вручную
 BOT_TOKEN = os.getenv("TGTOKEN") or "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE"
 assert BOT_TOKEN and BOT_TOKEN != "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE", "Укажи токен (TGTOKEN или строка в коде)."
 
 CONFIG_PATH = Path("config.json")
 SUPERADMINS={7393436735}
-# Можно стартово задать супер-админов через переменную окружения:
 # SUPERADMINS="123,456"
 ENV_SUPERADMINS = {int(x) for x in re.split(r"[,\s]+", os.getenv("SUPERADMINS", "").strip()) if x.isdigit()}
 
@@ -56,16 +58,41 @@ def load_config():
             if not isinstance(nm, int) or nm < 0:
                 nm = 1
             admins = set(map(int, data.get("superadmins", [])))
-            admins |= ENV_SUPERADMINS# добавляем из окружения
-            admins |= SUPERADMINS
+            admins |= ENV_SUPERADMINS
+
+            schedule = data.get("schedule", {}) or {}
+            schedule_enabled = bool(schedule.get("enabled", True))
+            open_time = schedule.get("open_time", "10:00")
+            close_time = schedule.get("close_time", "19:00")
+            tz_name = schedule.get("tz", "Europe/Moscow")
+
+            managed = data.get("managed_chats", [])
+            if not isinstance(managed, list):
+                managed = []
+
             return {
                 "banned_words": sorted(set(map(str.lower, data.get("banned_words", [])))),
                 "newbie_mute_minutes": nm,
                 "superadmins": sorted(admins),
+                "schedule": {
+                    "enabled": schedule_enabled,
+                    "open_time": open_time,
+                    "close_time": close_time,
+                    "tz": tz_name,
+                },
+                "managed_chats": sorted(
+                    set(int(x) for x in managed if isinstance(x, int) or str(x).lstrip("-").isdigit())
+                ),
             }
         except Exception:
             logging.exception("config.json повреждён, пересоздаю.")
-    return {"banned_words": [], "newbie_mute_minutes": 1, "superadmins": sorted(ENV_SUPERADMINS)}
+    return {
+        "banned_words": [],
+        "newbie_mute_minutes": 1,
+        "superadmins": sorted(ENV_SUPERADMINS),
+        "schedule": {"enabled": True, "open_time": "10:00", "close_time": "19:00", "tz": "Europe/Moscow"},
+        "managed_chats": [],
+    }
 
 def save_config(cfg: dict):
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -119,8 +146,25 @@ async def is_chat_admin(bot: Bot, chat_id: int, user_id: Optional[int], sender_c
     except Exception:
         return False
 
+def is_private(message: Message) -> bool:
+    return message.chat.type == "private"
+
 def is_superadmin(user_id: Optional[int]) -> bool:
     return bool(user_id) and int(user_id) in set(CONFIG.get("superadmins", []))
+
+async def can_manage(message: Message) -> bool:
+    """
+    Управление настройками:
+    - В личке: только супер‑админы.
+    - В группе: админы чата.
+    """
+    if is_private(message):
+        return is_superadmin(message.from_user.id if message.from_user else None)
+    return await is_chat_admin(
+        message.bot, message.chat.id,
+        message.from_user.id if message.from_user else None,
+        message.sender_chat.id if message.sender_chat else None
+    )
 
 def parse_badword_list(raw: str) -> list[str]:
     if raw is None:
@@ -133,27 +177,86 @@ def parse_badword_list(raw: str) -> list[str]:
         return [p.strip().lower() for p in parts if p.strip()]
     return [raw.lower()]
 
-def is_private(message: Message) -> bool:
-    return message.chat.type == "private"
+# ---------- Планировщик ----------
+SCHEDULER: AsyncIOScheduler | None = None
 
-async def can_manage(message: Message) -> bool:
-    """
-    Разрешение на управление настройками:
-    - В личке: только супер-админы.
-    - В группе/супергруппе: админы чата.
-    """
-    if is_private(message):
-        return is_superadmin(message.from_user.id if message.from_user else None)
-    return await is_chat_admin(
-        message.bot, message.chat.id,
-        message.from_user.id if message.from_user else None,
-        message.sender_chat.id if message.sender_chat else None
+def _get_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(CONFIG["schedule"].get("tz", "Europe/Moscow"))
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    s = s.strip()
+    hh, mm = s.split(":")
+    h, m = int(hh), int(mm)
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError
+    return h, m
+
+def _add_managed_chat(chat_id: int):
+    managed = set(CONFIG.get("managed_chats", []))
+    if chat_id not in managed:
+        managed.add(chat_id)
+        CONFIG["managed_chats"] = sorted(managed)
+        save_config(CONFIG)
+
+async def _set_chat_closed(bot: Bot, chat_id: int):
+    try:
+        await bot.set_chat_permissions(chat_id, MUTED_PERMS)
+    except Exception:
+        logging.debug(f"Failed to close chat {chat_id}", exc_info=True)
+
+async def _set_chat_open(bot: Bot, chat_id: int):
+    try:
+        await bot.set_chat_permissions(chat_id, UNMUTED_PERMS)
+    except Exception:
+        logging.debug(f"Failed to open chat {chat_id}", exc_info=True)
+
+def _reschedule_jobs(bot: Bot):
+    global SCHEDULER
+    if SCHEDULER is None:
+        return
+    # Удаляем предыдущие задания
+    for job in list(SCHEDULER.get_jobs()):
+        if job.id in ("auto_close", "auto_open"):
+            SCHEDULER.remove_job(job.id)
+
+    if not CONFIG["schedule"]["enabled"]:
+        logging.info("Schedule disabled")
+        return
+
+    tz = _get_tz()
+    try:
+        open_h, open_m = _parse_hhmm(CONFIG["schedule"]["open_time"])
+        close_h, close_m = _parse_hhmm(CONFIG["schedule"]["close_time"])
+    except Exception:
+        logging.error("Bad schedule times; using defaults 10:00 / 19:00")
+        open_h, open_m = 10, 0
+        close_h, close_m = 19, 0
+
+    async def close_all():
+        for chat_id in CONFIG.get("managed_chats", []):
+            await _set_chat_closed(bot, chat_id)
+
+    async def open_all():
+        for chat_id in CONFIG.get("managed_chats", []):
+            await _set_chat_open(bot, chat_id)
+
+    SCHEDULER.add_job(
+        close_all, CronTrigger(hour=close_h, minute=close_m, timezone=tz),
+        id="auto_close", replace_existing=True
     )
+    SCHEDULER.add_job(
+        open_all, CronTrigger(hour=open_h, minute=open_m, timezone=tz),
+        id="auto_open", replace_existing=True
+    )
+    logging.info(f"Schedule set: close {close_h:02d}:{close_m:02d}, open {open_h:02d}:{open_m:02d} ({tz})")
 
 # ==================== РОУТЕР ====================
 router = Router()
 
-# ---------- Сервисные утилиты ----------
+# ---------- Утилиты / суперадмины ----------
 @router.message(Command("myid"))
 async def cmd_myid(message: Message):
     uid = message.from_user.id if message.from_user else None
@@ -208,16 +311,20 @@ async def cmd_help(message: Message):
         "Глобальные настройки общие для всех чатов.\n"
         "Управление:\n"
         "• В группах — админы чата.\n"
-        "• В личке со мной — только супер‑админы (по ID).\n\n"
+        "• В личке со мной — супер‑админы (по ID).\n\n"
     )
     cmds = (
         "Команды:\n"
-        "• /mute1m — запретить писать всем на 1 минуту (только в группе)\n"
+        "• /mute1m — запретить писать всем на 1 минуту (в группе у админов)\n"
         "• /badwords — показать список запрещённых слов\n"
         "• /add_badword <слово или список> — столбик/запятые/reply\n"
         "• /remove_badword <слово или список>\n"
         "• /newbie_mute — показать авто‑мут новичков (мин)\n"
         "• /set_newbie_mute <минуты> — 0 = выключить\n"
+        "• /schedule_show — показать расписание (MSK)\n"
+        "• /schedule_set <HH:MM_открыть> <HH:MM_закрыть>\n"
+        "• /schedule_enable / /schedule_disable\n"
+        "• /schedule_tz <IANA_Timezone> (по умолчанию Europe/Moscow)\n"
         "\nСупер‑админские в личке:\n"
         "• /myid — показать ваш ID\n"
         "• /admins — список супер‑админов\n"
@@ -328,9 +435,83 @@ async def cmd_mute_all(message: Message):
             logging.debug("Failed to unmute chat back", exc_info=True)
     asyncio.create_task(unmute_later())
 
+# ---------- Расписание: команды ----------
+@router.message(Command("schedule_show"))
+async def cmd_schedule_show(message: Message):
+    if not await can_manage(message):
+        await message.reply("Недостаточно прав.")
+        return
+    s = CONFIG["schedule"]
+    await message.reply(
+        f"Расписание: {'включено' if s['enabled'] else 'выключено'}\n"
+        f"Открытие: {s['open_time']}  Закрытие: {s['close_time']}\n"
+        f"Таймзона: {s.get('tz', 'Europe/Moscow')}",
+        parse_mode=None
+    )
+
+@router.message(Command("schedule_set"))
+async def cmd_schedule_set(message: Message, command: CommandObject):
+    if not await can_manage(message):
+        await message.reply("Недостаточно прав.")
+        return
+    if not command.args:
+        await message.reply("Использование: /schedule_set <HH:MM_открыть> <HH:MM_закрыть>\nНапример: /schedule_set 10:00 19:00")
+        return
+    parts = command.args.split()
+    if len(parts) != 2:
+        await message.reply("Нужно два времени: открыть и закрыть. Пример: /schedule_set 10:00 19:00")
+        return
+    try:
+        _parse_hhmm(parts[0]); _parse_hhmm(parts[1])
+    except Exception:
+        await message.reply("Неверный формат времени. Используй HH:MM, например 09:30")
+        return
+    CONFIG["schedule"]["open_time"] = parts[0]
+    CONFIG["schedule"]["close_time"] = parts[1]
+    save_config(CONFIG)
+    _reschedule_jobs(message.bot)
+    await message.reply(f"Готово. Теперь: открыть {parts[0]}, закрыть {parts[1]}")
+
+@router.message(Command("schedule_enable"))
+async def cmd_schedule_enable(message: Message):
+    if not await can_manage(message):
+        await message.reply("Недостаточно прав.")
+        return
+    CONFIG["schedule"]["enabled"] = True
+    save_config(CONFIG)
+    _reschedule_jobs(message.bot)
+    await message.reply("Расписание включено.")
+
+@router.message(Command("schedule_disable"))
+async def cmd_schedule_disable(message: Message):
+    if not await can_manage(message):
+        await message.reply("Недостаточно прав.")
+        return
+    CONFIG["schedule"]["enabled"] = False
+    save_config(CONFIG)
+    _reschedule_jobs(message.bot)
+    await message.reply("Расписание выключено.")
+
+@router.message(Command("schedule_tz"))
+async def cmd_schedule_tz(message: Message, command: CommandObject):
+    if not await can_manage(message):
+        await message.reply("Недостаточно прав.")
+        return
+    tz = (command.args or "").strip() or "Europe/Moscow"
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        await message.reply("Неизвестная таймзона. Пример: Europe/Moscow")
+        return
+    CONFIG["schedule"]["tz"] = tz
+    save_config(CONFIG)
+    _reschedule_jobs(message.bot)
+    await message.reply(f"Таймзона установлена: {tz}")
+
 # ---------- Сервисные события ----------
 @router.message(F.new_chat_members)
 async def on_new_members(message: Message):
+    _add_managed_chat(message.chat.id)
     inviter_id = message.from_user.id if message.from_user else None
     chat_id = message.chat.id
     await delete_safely(message)  # чистим системку
@@ -363,7 +544,10 @@ async def on_left_member(message: Message):
 # ---------- Главный фильтр ----------
 @router.message()
 async def moderation_gate(message: Message):
-    # Админы чата и сообщения от имени чата — игнорируем фильтры
+    if message.chat.type in ("group", "supergroup"):
+        _add_managed_chat(message.chat.id)
+
+    # Админы чата (и анонимные) — игнорируем фильтры
     if await is_chat_admin(
         message.bot, message.chat.id,
         message.from_user.id if message.from_user else None,
@@ -410,6 +594,12 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
+
+    global SCHEDULER
+    SCHEDULER = AsyncIOScheduler()
+    SCHEDULER.start()
+    _reschedule_jobs(bot)  # подтянуть расписание из config.json
+
     await dp.start_polling(bot, allowed_updates=["message", "chat_member"])
 
 if __name__ == "__main__":

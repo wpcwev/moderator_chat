@@ -7,5 +7,14 @@
   "newbie_mute_minutes": 0,
   "superadmins": [
     7393436735
+  ],
+  "schedule": {
+    "enabled": true,
+    "open_time": "00:25",
+    "close_time": "00:26",
+    "tz": "Europe/Moscow"
+  },
+  "managed_chats": [
+    -1002909872942
   ]
 }
