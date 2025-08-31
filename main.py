@@ -38,7 +38,7 @@ MUTED_PERMS = ChatPermissions(
 
 UNMUTED_PERMS = ChatPermissions(
     can_send_messages=True,
-    can_send_media_messages=True,
+    can_send_media_messages=False,
     can_invite_users=True,
     can_pin_messages=False,
     can_change_info=False,
