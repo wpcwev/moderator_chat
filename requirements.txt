@@ -1,2 +1,4 @@
 aiohttp==3.12.8
 aiogram==3.21.0
+APsheduler==3.10.4
+tzdata>=2024.1
