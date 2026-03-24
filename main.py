@@ -96,6 +96,7 @@ def load_config():
     }
 
 def save_config(cfg: dict):
+    print("SAVE_CONFIG ->", CONFIG_PATH.resolve(), cfg)
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 CONFIG = load_config()
