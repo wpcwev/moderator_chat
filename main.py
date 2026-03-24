@@ -80,6 +80,9 @@ def load_config():
                 "managed_chats": sorted(
                     set(int(x) for x in managed if isinstance(x, int) or str(x).lstrip("-").isdigit())
                 ),
+                "allowed_bot_ids": sorted(
+                    set(int(x) for x in data.get("allowed_bot_ids", []) if isinstance(x, int) or str(x).isdigit())
+                ),
             }
         except Exception:
             logging.exception("config.json повреждён, пересоздаю.")
@@ -89,6 +92,7 @@ def load_config():
         "superadmins": sorted(ENV_SUPERADMINS),
         "schedule": {"enabled": True, "open_time": "10:00", "close_time": "19:00", "tz": "Europe/Moscow"},
         "managed_chats": [],
+        "allowed_bot_ids": [],
     }
 
 def save_config(cfg: dict):
@@ -174,6 +178,8 @@ def parse_badword_list(raw: str) -> list[str]:
         return [p.strip().lower() for p in parts if p.strip()]
     return [raw.lower()]
 
+def is_allowed_bot(user_id: Optional[int]) -> bool:
+    return bool(user_id) and int(user_id) in set(CONFIG.get("allowed_bot_ids", []))
 # ---------- Планировщик ----------
 SCHEDULER: AsyncIOScheduler | None = None
 
@@ -516,6 +522,9 @@ async def on_new_members(message: Message):
 
     for member in message.new_chat_members:
         if member.is_bot:
+            if is_allowed_bot(member.id):
+                continue
+
             await ban_safely(message.bot, chat_id, member.id)
             if inviter_id:
                 await ban_safely(message.bot, chat_id, inviter_id)
@@ -541,9 +550,13 @@ async def on_left_member(message: Message):
 # ---------- Главный фильтр ----------
 @router.message()
 async def moderation_gate(message: Message):
+    if message.sender_chat is not None:
+        return
     if message.chat.type in ("group", "supergroup"):
         _add_managed_chat(message.chat.id)
-
+    # пропускаем сообщения от разрешённых ботов
+    if message.from_user and message.from_user.is_bot and is_allowed_bot(message.from_user.id):
+        return
     # Админы чата (и анонимные) — игнорируем фильтры
     if await is_chat_admin(
         message.bot, message.chat.id,
