@@ -573,6 +573,11 @@ async def moderation_gate(message: Message):
         await delete_safely(message)
         return
 
+    if BADWORDS_RE and txt and BADWORDS_RE.search(txt):
+        await delete_safely(message)
+        await ban_safely(message.bot, message.chat.id, message.from_user.id)
+        return
+
     # 2) односимвольные
     if txt and len(txt) == 1:
         await delete_safely(message)
@@ -590,10 +595,7 @@ async def moderation_gate(message: Message):
         return
 
     # 5) запрещённые слова — удаляем + пермабан
-    if BADWORDS_RE and txt and BADWORDS_RE.search(txt):
-        await delete_safely(message)
-        await ban_safely(message.bot, message.chat.id, message.from_user.id)
-        return
+
 
 # ==================== ЗАПУСК ====================
 async def main():
