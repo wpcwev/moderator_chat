@@ -558,6 +558,11 @@ async def moderation_gate(message: Message):
     # пропускаем сообщения от разрешённых ботов
     if message.from_user and message.from_user.is_bot and is_allowed_bot(message.from_user.id):
         return
+    # Block any non-whitelisted bot that managed to send a message.
+    if message.from_user and message.from_user.is_bot:
+        await delete_safely(message)
+        await ban_safely(message.bot, message.chat.id, message.from_user.id)
+        return
     # Админы чата (и анонимные) — игнорируем фильтры
     if await is_chat_admin(
         message.bot, message.chat.id,
