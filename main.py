@@ -120,7 +120,7 @@ BADWORDS_RE = build_badwords_regex()
 # ==================== ХЕЛПЕРЫ ====================
 URL_RE = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+|telegram\.org/\S+)", re.IGNORECASE)
 USERNAME_RE = re.compile(r"(?<!\w)@([a-zA-Z0-9_]{5,})\b")
-BOT_MENTION_TRIGGER_TTL = timedelta(minutes=10)
+BOT_MENTION_TRIGGER_TTL = timedelta(hours=1)
 BOT_MENTION_TRIGGERS = {}
 
 def text_of(msg: Message) -> str:
