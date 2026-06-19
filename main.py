@@ -120,6 +120,8 @@ BADWORDS_RE = build_badwords_regex()
 # ==================== ХЕЛПЕРЫ ====================
 URL_RE = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+|telegram\.org/\S+)", re.IGNORECASE)
 USERNAME_RE = re.compile(r"(?<!\w)@([a-zA-Z0-9_]{5,})\b")
+BOT_MENTION_TRIGGER_TTL = timedelta(minutes=10)
+BOT_MENTION_TRIGGERS = {}
 
 def text_of(msg: Message) -> str:
     return (msg.text or msg.caption or "").strip()
@@ -182,23 +184,59 @@ def parse_badword_list(raw: str) -> list[str]:
 def is_allowed_bot(user_id: Optional[int]) -> bool:
     return bool(user_id) and int(user_id) in set(CONFIG.get("allowed_bot_ids", []))
 
+def mentioned_usernames(text: str) -> set[str]:
+    return {match.group(1).lower() for match in USERNAME_RE.finditer(text or "")}
+
 def message_mentions_user(message: Message, user) -> bool:
     username = getattr(user, "username", None)
     if not username:
         return False
-    return ("@" + username.lower()) in text_of(message).lower()
+    return username.lower() in mentioned_usernames(text_of(message))
+
+def cleanup_bot_mention_triggers(now: datetime):
+    expired_keys = [
+        key for key, (_, created_at) in BOT_MENTION_TRIGGERS.items()
+        if now - created_at > BOT_MENTION_TRIGGER_TTL
+    ]
+    for key in expired_keys:
+        BOT_MENTION_TRIGGERS.pop(key, None)
+
+def remember_bot_mentions(message: Message, txt: str):
+    if not message.from_user or message.from_user.is_bot:
+        return
+    now = datetime.now(timezone.utc)
+    cleanup_bot_mention_triggers(now)
+    for username in mentioned_usernames(txt):
+        BOT_MENTION_TRIGGERS[(message.chat.id, username)] = (message.from_user.id, now)
 
 async def ban_bot_trigger_author(message: Message):
     reply = getattr(message, "reply_to_message", None)
     if not reply or not message.from_user or not message_mentions_user(reply, message.from_user):
-        return
+        return None
     trigger_author = reply.from_user
     if not trigger_author or trigger_author.is_bot:
-        return
+        return None
     if await is_chat_admin(message.bot, message.chat.id, trigger_author.id):
-        return
+        return None
     await delete_safely(reply)
     await ban_safely(message.bot, message.chat.id, trigger_author.id)
+    return trigger_author.id
+
+async def ban_remembered_bot_trigger_author(message: Message, skip_user_id: Optional[int] = None):
+    username = getattr(message.from_user, "username", None) if message.from_user else None
+    if not username:
+        return
+    now = datetime.now(timezone.utc)
+    cleanup_bot_mention_triggers(now)
+    remembered = BOT_MENTION_TRIGGERS.pop((message.chat.id, username.lower()), None)
+    if not remembered:
+        return
+    trigger_author_id, created_at = remembered
+    if now - created_at > BOT_MENTION_TRIGGER_TTL or trigger_author_id == skip_user_id:
+        return
+    if await is_chat_admin(message.bot, message.chat.id, trigger_author_id):
+        return
+    await ban_safely(message.bot, message.chat.id, trigger_author_id)
 # ---------- Планировщик ----------
 SCHEDULER: AsyncIOScheduler | None = None
 
@@ -580,7 +618,8 @@ async def moderation_gate(message: Message):
     if message.from_user and message.from_user.is_bot:
         await delete_safely(message)
         await ban_safely(message.bot, message.chat.id, message.from_user.id)
-        await ban_bot_trigger_author(message)
+        trigger_author_id = await ban_bot_trigger_author(message)
+        await ban_remembered_bot_trigger_author(message, trigger_author_id)
         return
     # Админы чата (и анонимные) — игнорируем фильтры
     if await is_chat_admin(
@@ -591,6 +630,7 @@ async def moderation_gate(message: Message):
         return
 
     txt = text_of(message)
+    remember_bot_mentions(message, txt)
 
     # 1) медиа: аудио/видео/voice/video_note — удаляем без бана
     if message.audio or message.video or message.voice or message.video_note:
