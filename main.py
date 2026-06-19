@@ -181,6 +181,24 @@ def parse_badword_list(raw: str) -> list[str]:
 
 def is_allowed_bot(user_id: Optional[int]) -> bool:
     return bool(user_id) and int(user_id) in set(CONFIG.get("allowed_bot_ids", []))
+
+def message_mentions_user(message: Message, user) -> bool:
+    username = getattr(user, "username", None)
+    if not username:
+        return False
+    return ("@" + username.lower()) in text_of(message).lower()
+
+async def ban_bot_trigger_author(message: Message):
+    reply = getattr(message, "reply_to_message", None)
+    if not reply or not message.from_user or not message_mentions_user(reply, message.from_user):
+        return
+    trigger_author = reply.from_user
+    if not trigger_author or trigger_author.is_bot:
+        return
+    if await is_chat_admin(message.bot, message.chat.id, trigger_author.id):
+        return
+    await delete_safely(reply)
+    await ban_safely(message.bot, message.chat.id, trigger_author.id)
 # ---------- Планировщик ----------
 SCHEDULER: AsyncIOScheduler | None = None
 
@@ -562,6 +580,7 @@ async def moderation_gate(message: Message):
     if message.from_user and message.from_user.is_bot:
         await delete_safely(message)
         await ban_safely(message.bot, message.chat.id, message.from_user.id)
+        await ban_bot_trigger_author(message)
         return
     # Админы чата (и анонимные) — игнорируем фильтры
     if await is_chat_admin(
