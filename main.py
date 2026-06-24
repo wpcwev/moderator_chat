@@ -10,7 +10,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, ChatPermissions
+from aiogram.types import Message, ChatPermissions, KeyboardButton, ReplyKeyboardMarkup
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -122,6 +122,8 @@ URL_RE = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+|telegram\.org/\S+
 USERNAME_RE = re.compile(r"(?<!\w)@([a-zA-Z0-9_]{5,})\b")
 BOT_MENTION_TRIGGER_TTL = timedelta(hours=1)
 BOT_MENTION_TRIGGERS = {}
+ADD_BADWORD_BUTTON = "➕ Добавить банворд"
+ADD_BADWORD_WAITING = set()
 
 def text_of(msg: Message) -> str:
     return (msg.text or msg.caption or "").strip()
@@ -156,6 +158,26 @@ def is_private(message: Message) -> bool:
 def is_superadmin(user_id: Optional[int]) -> bool:
     return bool(user_id) and int(user_id) in set(CONFIG.get("superadmins", []))
 
+def is_private_superadmin_message(message: Message) -> bool:
+    return is_private(message) and is_superadmin(message.from_user.id if message.from_user else None)
+
+def admin_private_keyboard(message: Message):
+    if not is_private_superadmin_message(message):
+        return None
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=ADD_BADWORD_BUTTON)]],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери действие",
+    )
+
+def is_waiting_add_badword(message: Message) -> bool:
+    return (
+        is_private_superadmin_message(message)
+        and bool(message.from_user)
+        and message.from_user.id in ADD_BADWORD_WAITING
+        and not text_of(message).startswith("/")
+    )
+
 async def can_manage(message: Message) -> bool:
     """
     Управление настройками:
@@ -180,6 +202,18 @@ def parse_badword_list(raw: str) -> list[str]:
         parts = re.split(r"[,\n;]+", raw)
         return [p.strip().lower() for p in parts if p.strip()]
     return [raw.lower()]
+
+def add_badwords_to_config(words: list[str]) -> list[str]:
+    before = set(CONFIG["banned_words"])
+    after = before.union(words)
+    CONFIG["banned_words"] = sorted(after)
+    save_config(CONFIG)
+    global BADWORDS_RE
+    BADWORDS_RE = build_badwords_regex()
+    return sorted(set(words) - before)
+
+def format_added_badwords_reply(added: list[str]) -> str:
+    return ("Добавлено: " + ", ".join(added[:20]) + ("…" if len(added) > 20 else "")) if added else "Ничего нового."
 
 def is_allowed_bot(user_id: Optional[int]) -> bool:
     return bool(user_id) and int(user_id) in set(CONFIG.get("allowed_bot_ids", []))
@@ -391,7 +425,16 @@ async def cmd_help(message: Message):
         "• /add_admin <id> /remove_admin <id>\n"
         "\nПравила модерации: удаляю системные сообщения, ссылки, @username, аудио/видео/войс/видеосообщения, односимвольные; за запрещённые слова — удаление и пермабан; добавленных ботов — удаляю, пригласившего — бан. Администраторы чата и супер‑админы не подпадают под фильтры."
     )
-    await message.reply(header + cmds, parse_mode=None)
+    await message.reply(header + cmds, parse_mode=None, reply_markup=admin_private_keyboard(message))
+
+@router.message(F.text == ADD_BADWORD_BUTTON, is_private_superadmin_message)
+async def cmd_add_badword_button(message: Message):
+    ADD_BADWORD_WAITING.add(message.from_user.id)
+    await message.answer(
+        "Отправь слово, фразу или список запрещённых слов. Можно столбиком, через запятую или через точку с запятой.",
+        parse_mode=None,
+        reply_markup=admin_private_keyboard(message),
+    )
 
 @router.message(Command("badwords"))
 async def cmd_badwords(message: Message):
@@ -416,14 +459,22 @@ async def cmd_add_badword(message: Message, command: CommandObject):
             parse_mode=None,
         )
         return
-    before = set(CONFIG["banned_words"])
-    after = before.union(words)
-    CONFIG["banned_words"] = sorted(after)
-    save_config(CONFIG)
-    global BADWORDS_RE
-    BADWORDS_RE = build_badwords_regex()
-    added = sorted(set(words) - before)
-    await message.reply(("Добавлено: " + ", ".join(added[:20]) + ("…" if len(added) > 20 else "")) if added else "Ничего нового.")
+    added = add_badwords_to_config(words)
+    await message.reply(format_added_badwords_reply(added), reply_markup=admin_private_keyboard(message))
+
+@router.message(is_waiting_add_badword)
+async def cmd_add_badword_waiting_input(message: Message):
+    ADD_BADWORD_WAITING.discard(message.from_user.id)
+    words = parse_badword_list(text_of(message))
+    if not words:
+        await message.reply(
+            "Не вижу слова для добавления. Нажми кнопку ещё раз и отправь слово или список.",
+            parse_mode=None,
+            reply_markup=admin_private_keyboard(message),
+        )
+        return
+    added = add_badwords_to_config(words)
+    await message.reply(format_added_badwords_reply(added), reply_markup=admin_private_keyboard(message))
 
 @router.message(Command("remove_badword"))
 async def cmd_remove_badword(message: Message, command: CommandObject):
